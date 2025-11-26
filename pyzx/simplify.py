@@ -140,8 +140,14 @@ def bialg_simp(g: BaseGraph[VT,ET], quiet:bool=True, stats: Optional[Stats]=None
     return simp(g, 'bialg_simp', match_bialg_parallel, bialg, quiet=quiet, stats=stats)
 
 def spider_simp(g: BaseGraph[VT,ET], matchf:Optional[Callable[[VT],bool]]=None, quiet:bool=True, stats:Optional[Stats]=None) -> int:
-    """Keeps performing spider fusion until the list of matches supplied by :func:`match_spider_parallel` is empty."""
-    return simp(g, 'spider_simp', match_spider_parallel, spider, matchf=matchf, quiet=quiet, stats=stats)
+    """Keeps performing spider fusion until the list of matches supplied by :func:`match_spider_parallel` is empty. Self-loops are removed."""
+    result = simp(g, 'spider_simp', match_spider_parallel, spider,
+                auto_simplify_parallel_edges=True, matchf=matchf, quiet=quiet, stats=stats)
+
+    # Convert any remaining self-loops to phases, and count them.
+    result += simp(g, 'spider_simp_self_loop_cleanup', match_self_loop, remove_self_loops, quiet=quiet, stats=stats)
+
+    return result
 
 def id_simp(g: BaseGraph[VT,ET], matchf:Optional[Callable[[VT],bool]]=None, quiet:bool=True, stats:Optional[Stats]=None) -> int:
     """Removes all non-interacting identity vertices found by :func:`match_ids_parallel`."""
@@ -279,21 +285,21 @@ class Simplifier(Generic[VT, ET]):
         p2 = self.mastergraph.phase(v2)
         m1 = self.simplifygraph.phase_mult[i1]
         m2 = self.simplifygraph.phase_mult[i2]
-        if (p2 == 0 or p2.denominator <= 2): # Deleted vertex contains Clifford phase
+        if phase_is_clifford(p2): # Deleted vertex contains Clifford phase
             if v2 in self.phantom_phases:
                 v3,i3 = self.phantom_phases[v2]
                 m2 = cast(Literal[1, -1], m2*self.simplifygraph.phase_mult[i3])
                 v2,i2 = v3,i3
                 p2 = self.mastergraph.phase(v2)
             else: return
-        if (p1 == 0 or p1.denominator <= 2): # Need to save non-Clifford location
+        if phase_is_clifford(p1): # Need to save non-Clifford location
             self.simplifygraph.phase_mult[i1] = 1
             if v1 in self.phantom_phases: # Already fused with non-Clifford before
                 v3,i3 = self.phantom_phases[v1]
                 self.mastergraph.phase_index[v3] = i1
                 del self.mastergraph.phase_index[v1]
                 p1 = self.mastergraph.phase(v3)
-                if (p1+p2).denominator <= 2:
+                if phase_is_clifford(p1 + p2):
                     del self.phantom_phases[v1]
                 v1,i1 = v3,i3
                 m1 = cast(Literal[1, -1], m1*self.simplifygraph.phase_mult[i3])
@@ -301,7 +307,7 @@ class Simplifier(Generic[VT, ET]):
                 self.phantom_phases[v1] = (v2,i2)
                 self.simplifygraph.phase_mult[i2] = m2
                 return
-        if p1.denominator <= 2 or p2.denominator <= 2: raise Exception("Clifford phases here??")
+        if phase_is_clifford(p1) or phase_is_clifford(p2): raise Exception("Clifford phases here??")
         # Both have non-Clifford phase
         if m1*m2 == 1: phase = (p1 + p2)%2
         else: phase = p1 - p2

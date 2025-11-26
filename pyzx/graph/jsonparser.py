@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from .multigraph import Multigraph
 
 
-def string_to_phase(string: str, g: Union[BaseGraph,'GraphDiff']) -> Union[Fraction, Poly]:
+def string_to_phase(string: str, g: Optional[Union[BaseGraph,'GraphDiff']] = None) -> Union[Fraction, Poly]:
     if not string:
         return Fraction(0)
     try:
@@ -57,6 +57,8 @@ def string_to_phase(string: str, g: Union[BaseGraph,'GraphDiff']) -> Union[Fract
             return Fraction(int(s))
     except ValueError:
         def _new_var(name: str) -> Poly:
+            if g is None:
+                return new_var(name, is_bool=False)
             return new_var(name, is_bool=g.var_registry.get_type(name, False), registry=g.var_registry)
         try:
             return parse(string, _new_var)
@@ -211,7 +213,16 @@ def graph_to_dict(g: BaseGraph[VT,ET], include_scalar: bool=True) -> Dict[str, A
             d_v['phase'] = phase_to_s(g.phase(v))
         vdata_keys = g.vdata_keys(v)
         if vdata_keys:
-            d_v['data'] = {k: g.vdata(v,k) for k in vdata_keys}
+            data_dict = {}
+            for k in vdata_keys:
+                val = g.vdata(v, k)
+                if k == 'label':
+                    if isinstance(val, (Fraction, Poly)):
+                        val = phase_to_s(val)
+                    elif isinstance(val, complex):
+                        val = str(val)
+                data_dict[k] = val
+            d_v['data'] = data_dict
         if g.is_ground(v):
             d_v['is_ground'] = True
         verts.append(d_v)
@@ -374,6 +385,11 @@ def dict_to_graph(d: Dict[str,Any], backend: Optional[str]=None) -> BaseGraph:
             g.set_ground(v)
         if 'data' in v_d:
             for k,val in v_d['data'].items():
+                if k == 'label' and isinstance(val, str):
+                    try:
+                        val = complex(val)
+                    except ValueError:
+                        val = string_to_phase(val, g)
                 g.set_vdata(v,k,val)
 
     if 'edata' in d:
@@ -381,6 +397,14 @@ def dict_to_graph(d: Dict[str,Any], backend: Optional[str]=None) -> BaseGraph:
 
     for (s,t,et) in d['edges']:
         g.add_edge((s,t),et)
+
+    if 'inputs' in d:
+        g.set_inputs(tuple(d['inputs']))
+    if 'outputs' in d:
+        g.set_outputs(tuple(d['outputs']))
+
+    if 'scalar' in d:
+        g.scalar = Scalar.from_json(d['scalar'])
 
     return g
 
