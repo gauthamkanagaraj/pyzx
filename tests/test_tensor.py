@@ -30,12 +30,17 @@ from pyzx.graph import Graph
 from pyzx.graph.multigraph import Multigraph
 from pyzx.generate import cliffords
 from pyzx.circuit import Circuit
-from pyzx.utils import VertexType, set_h_box_label
+from pyzx.utils import VertexType, EdgeType, set_h_box_label
 
 np: Optional[ModuleType]
 try:
     import numpy as np
-    from pyzx.tensor import tensorfy, compare_tensors, compose_tensors, adjoint, H_to_tensor
+    from pyzx.tensor import (tensorfy, tensorfy_naive, naive_cost_estimate, compare_tensors,
+                             compose_tensors, adjoint, H_to_tensor)
+    from pyzx.rank_width import rw_peak_exact, tensorfy_rw
+    from pyzx.simplify import full_reduce
+    from pyzx.generate import cliffordT
+    from pyzx.symbolic import new_var
 except ImportError:
     np = None
 
@@ -280,6 +285,168 @@ class TestTensor(unittest.TestCase):
         set_h_box_label(g2, h2, -1)
 
         self.assertTrue(compare_tensors(g1, g2, preserve_scalar=True))
+
+
+@unittest.skipUnless(np, "numpy needs to be installed for this to run")
+class TestTensorAuto(unittest.TestCase):
+    """Tests for tensorfy(strategy='auto') and its cost estimators."""
+
+    GIB = 1 << 30
+
+    # ---- fixtures (match the validated POC corpus) ----
+    @staticmethod
+    def _cnot():
+        g = Graph()
+        in0 = g.add_vertex(VertexType.BOUNDARY, 0, 0)
+        in1 = g.add_vertex(VertexType.BOUNDARY, 1, 0)
+        z = g.add_vertex(VertexType.Z, 0, 1)
+        x = g.add_vertex(VertexType.X, 1, 1)
+        o0 = g.add_vertex(VertexType.BOUNDARY, 0, 2)
+        o1 = g.add_vertex(VertexType.BOUNDARY, 1, 2)
+        for e in [(in0, z), (in1, x), (z, x), (z, o0), (x, o1)]:
+            g.add_edge(e, EdgeType.SIMPLE)
+        g.set_inputs((in0, in1)); g.set_outputs((o0, o1))
+        return g
+
+    @staticmethod
+    def _dense_closed(n, m, seed):
+        from fractions import Fraction
+        random.seed(seed)
+        g = Graph()
+        for _ in range(n):
+            g.add_vertex(VertexType.Z, phase=Fraction(random.randint(0, 7), 4))
+        while g.num_edges() < m:
+            u, v = random.sample(range(n), 2)
+            if (u, v) not in g.edge_set() and (v, u) not in g.edge_set():
+                g.add_edge((u, v), EdgeType.HADAMARD)
+        return g
+
+    @staticmethod
+    def _clifford(q, d, p_t, seed):
+        random.seed(seed); np.random.seed(seed)
+        c = cliffordT(q, d, p_t=p_t)
+        return c.to_graph() if hasattr(c, "to_graph") else c
+
+    def _path(self, g, max_memory):
+        """The verbose path 'auto' prints for graph g under the given budget."""
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tensorfy(g, strategy='auto', max_memory=max_memory, verbose=True)
+        return buf.getvalue()
+
+    @staticmethod
+    def _measured_rw_peak(g):
+        """log2 of the largest array a real tensorfy_rw run allocates for g."""
+        import pyzx.rank_width as rwm
+        biggest = [0]
+        def note(a):
+            if hasattr(a, "size"):
+                biggest[0] = max(biggest[0], int(a.size))
+        def wrap(f):
+            def inner(*a, **k):
+                out = f(*a, **k); note(out); return out
+            return inner
+        orig = (np.kron, np.fft.fftn, np.tensordot, rwm.apply_parity_map)
+        np.kron, np.fft.fftn, np.tensordot = wrap(orig[0]), wrap(orig[1]), wrap(orig[2])
+        rwm.apply_parity_map = wrap(orig[3])
+        try:
+            note(tensorfy_rw(g, strategy='rw-auto'))
+        finally:
+            np.kron, np.fft.fftn, np.tensordot = orig[0], orig[1], orig[2]
+            rwm.apply_parity_map = orig[3]
+        return round(math.log2(biggest[0])) if biggest[0] else 0
+
+    # ---- estimators ----
+    def test_naive_estimate_peak_is_exact(self):
+        # peak is purely structural, so it matches the true peaks exactly
+        self.assertEqual(naive_cost_estimate(self._cnot())[0], 5)
+        self.assertEqual(naive_cost_estimate(self._clifford(6, 40, 0.2, 1337))[0], 13)
+        self.assertEqual(naive_cost_estimate(self._clifford(8, 60, 0.2, 1337))[0], 17)
+        self.assertEqual(naive_cost_estimate(self._dense_closed(14, 40, 1337))[0], 23)
+
+    def test_rw_peak_exact_matches_real_run(self):
+        from pyzx.rank_width import (greedy_b2t_decomposition, linear_decomposition,
+                                     greedy_linear_order, rank_score_flops)
+        g = self._dense_closed(14, 40, 1337)
+        gr = g.copy(); full_reduce(gr)
+        decomps = {'b2t': greedy_b2t_decomposition(gr),
+                   'linear': linear_decomposition(greedy_linear_order(gr))}
+        flops = {k: rank_score_flops(d, gr) for k, d in decomps.items()}
+        pick = min(flops, key=lambda k: flops[k])      # rw-auto chooses min flops
+        self.assertEqual(rw_peak_exact(decomps[pick], gr), self._measured_rw_peak(g))
+
+    # ---- correctness ----
+    def test_auto_matches_naive_circuit(self):
+        g = self._clifford(8, 60, 0.2, 1337)
+        self.assertTrue(compare_tensors(tensorfy(g, strategy='auto', max_memory=self.GIB),
+                                        tensorfy_naive(g), preserve_scalar=False))
+
+    def test_auto_matches_naive_dense(self):
+        g = self._dense_closed(14, 40, 1337)
+        self.assertTrue(compare_tensors(tensorfy(g, strategy='auto', max_memory=self.GIB),
+                                        tensorfy_naive(g), preserve_scalar=False))
+
+    def test_reduced_naive_equals_raw_naive(self):
+        # the invariant that licenses the full_reduce candidate (up to global scalar)
+        for g in (self._clifford(6, 40, 0.2, 1337), self._dense_closed(14, 40, 1337)):
+            gr = g.copy(); full_reduce(gr)
+            self.assertTrue(compare_tensors(tensorfy_naive(gr), tensorfy_naive(g),
+                                            preserve_scalar=False))
+
+    def test_auto_via_graph_wrapper(self):
+        g = self._clifford(6, 40, 0.2, 1337)
+        self.assertTrue(compare_tensors(g.to_tensor(strategy='auto', max_memory=self.GIB),
+                                        tensorfy_naive(g), preserve_scalar=False))
+
+    # ---- capability gate ----
+    def test_gate_hbox_falls_back_to_naive(self):
+        g = Graph()
+        i = g.add_vertex(VertexType.BOUNDARY, 0, 0)
+        h = g.add_vertex(VertexType.H_BOX, 0, 1)
+        o = g.add_vertex(VertexType.BOUNDARY, 0, 2)
+        g.set_inputs((i,)); g.set_outputs((o,))
+        g.add_edge((i, h)); g.add_edge((h, o))
+        t = tensorfy(g, strategy='auto', max_memory=self.GIB)   # must not raise
+        self.assertTrue(compare_tensors(t, tensorfy_naive(g), preserve_scalar=False))
+
+    def test_gate_symbolic_phase_raises(self):
+        g = Graph()
+        a = new_var('a', is_bool=False, registry=g.var_registry)
+        i = g.add_vertex(VertexType.BOUNDARY, 0, 0)
+        z = g.add_vertex(VertexType.Z, 0, 1, phase=a)
+        o = g.add_vertex(VertexType.BOUNDARY, 0, 2)
+        g.set_inputs((i,)); g.set_outputs((o,))
+        g.add_edge((i, z)); g.add_edge((z, o))
+        with self.assertRaises(ValueError):
+            tensorfy(g, strategy='auto', max_memory=self.GIB)
+
+    # ---- selector paths ----
+    def test_path_circuit_uses_raw_fastpath(self):
+        self.assertIn("raw-naive fits & cheap", self._path(self._cnot(), self.GIB))
+
+    def test_path_dense_uses_reduced(self):
+        self.assertIn("naive on reduced", self._path(self._dense_closed(14, 40, 1337), self.GIB))
+
+    def test_path_raw_over_budget_rescued_to_reduced(self):
+        # raw peak over budget, reduced peak fits -> naive(reduced), NOT escalated to rw
+        self.assertIn("naive on reduced", self._path(self._dense_closed(22, 90, 2024), self.GIB))
+
+    def test_path_rw_branch_when_naive_infeasible(self):
+        # tiny budget: both naive variants over budget but rw fits -> rw branch runs
+        g = self._dense_closed(14, 40, 1337)
+        self.assertIn("-> rw", self._path(g, 1024))
+        self.assertTrue(compare_tensors(tensorfy(g, strategy='auto', max_memory=1024),
+                                        tensorfy_naive(g), preserve_scalar=False))
+
+    def test_over_budget_raises_clear_memoryerror(self):
+        with self.assertRaises(MemoryError) as cm:
+            tensorfy(self._dense_closed(14, 40, 1337), strategy='auto', max_memory=16)
+        self.assertIn("rw 2^", str(cm.exception))      # message names all three peaks
+
+    def test_unknown_strategy_still_raises(self):
+        with self.assertRaises(ValueError):
+            tensorfy(self._cnot(), strategy='bogus')
 
 
 if __name__ == '__main__':

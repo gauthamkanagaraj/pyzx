@@ -39,9 +39,9 @@ import numpy as np
 np.set_printoptions(suppress=True)
 
 # typing imports
-from typing import TYPE_CHECKING, List, Dict, Union
+from typing import TYPE_CHECKING, List, Dict, Union, Tuple
 from numpy.typing import NDArray
-from .utils import FractionLike, FloatInt, VertexType, EdgeType, get_z_box_label
+from .utils import FractionLike, FloatInt, VertexType, EdgeType, get_z_box_label, settings
 if TYPE_CHECKING:
     from .graph.base import BaseGraph, VT, ET
     from .circuit import Circuit
@@ -101,24 +101,46 @@ def pop_and_shift(verts, indices):
             indices[w] = l2
     return res
 
+# Vertex types only the naive backend can tensorfy: rank-width's full_reduce/leaf code
+# rejects them, so 'auto' routes any diagram containing them to naive.
+_RW_BLOCKERS = {VertexType.H_BOX, VertexType.W_INPUT, VertexType.W_OUTPUT, VertexType.Z_BOX}
+
+# log2(flops) below which raw-naive is cheap enough that 'auto' skips the (otherwise
+# dominated) full_reduce probe and runs it directly. Optimization gate only: a wrong value
+# costs at most one wasted full_reduce, never correctness.
+_FAST_ENOUGH = 22
+
+
 def tensorfy(g: 'BaseGraph[VT,ET]',
              preserve_scalar: bool = True,
              strategy: str = 'naive',
-             verbose: bool = False) -> NDArray[np.complex128]:
+             verbose: bool = False,
+             max_memory: Optional[int] = None) -> NDArray[np.complex128]:
     """
     Returns a multidimensional numpy array representing the linear map the ZX diagram implements.
     Available simulation strategies are:
 
     - 'naive': good for sparse graphs
+    - 'auto': estimate naive's peak memory (cheaply and exactly) on both the diagram and its
+      ``full_reduce``d form, run naive on whichever is cheaper and fits ``max_memory``, and
+      fall back to rank-width only when neither does. Raises ``MemoryError`` reporting the
+      predicted sizes if no backend fits the budget.
     - 'rw-greedy-b2t': rank-width with greedy bottom-to-top heuristic
     - 'rw-greedy-linear': rank-width with greedy-linear heuristic
     - 'rw-auto': choose the best of 'rw-greedy-b2t' and 'rw-greedy-linear'
 
     Args:
         g: ZX diagram
-        preserve_scalar: whether to account for the diagram scalar
+        preserve_scalar: whether to account for the diagram scalar. With ``strategy='auto'``
+            the result can differ from ``'naive'`` by a global scalar whenever the reduced
+            graph or rank-width is used (the same convention as ``'rw-*'``); compare with
+            :func:`compare_tensors` rather than ``numpy.allclose`` when ``preserve_scalar=False``.
         strategy: which simulation strategy to use
-        verbose: print additional info
+        verbose: print additional info (``'auto'`` prints the path it chose)
+        max_memory: only used by ``strategy='auto'``: byte budget for the largest intermediate
+            tensor. ``None`` (default) detects a conservative fraction of available RAM (via
+            ``psutil`` if installed, else a static fallback). ``'auto'`` raises ``ValueError``
+            on diagrams with symbolic (``Poly``) phases, which no backend can tensorfy.
 
     Returns:
         Numpy tensor having (num_inputs + num_outputs) dimensions (output dimensions first)
@@ -127,6 +149,9 @@ def tensorfy(g: 'BaseGraph[VT,ET]',
         raise ValueError("Hybrid graphs are not supported.")
     if strategy == 'naive':
         return tensorfy_naive(g, preserve_scalar=preserve_scalar)
+    elif strategy == 'auto':
+        return _tensorfy_auto(g, preserve_scalar=preserve_scalar,
+                              max_memory=max_memory, verbose=verbose)
     elif strategy.startswith('rw-'):
         from .rank_width import tensorfy_rw
         return tensorfy_rw(g, strategy=strategy, preserve_scalar=preserve_scalar, verbose=verbose)
@@ -240,6 +265,150 @@ def tensorfy_naive(g: 'BaseGraph[VT,ET]', preserve_scalar: bool = True) -> NDArr
     tensor = np.transpose(tensor,perm)
     if preserve_scalar: tensor *= g.scalar.to_number()
     return tensor
+
+def naive_cost_estimate(g: 'BaseGraph[VT,ET]') -> Tuple[int, float]:
+    """Predict ``tensorfy_naive(g)``'s cost in O(V+E) without building any tensors.
+
+    Returns ``(peak_rank, log2_flops)``, where ``peak_rank`` is the log2 of the largest
+    intermediate the backend ever holds (so its memory is ``16 * 2**peak_rank`` bytes) and
+    ``log2_flops`` is a log2 estimate of the total tensordot work. The contraction's tensor
+    *shapes* depend only on the diagram's topology -- not on phases or vertex colour -- so this
+    dry-run of ``tensorfy_naive``'s row-order contraction is exact for the dense-tensordot
+    backend.
+
+    ``peak_rank`` is the max over each step of (a) the running accumulator and (b) the
+    spider's own dense ``2**d`` vertex tensor; a high-degree spider can make the latter the
+    larger one, so the accumulator alone would under-count (and so route an out-of-memory
+    contraction to naive).
+    """
+    rows = g.rows()
+    types = g.types()
+    inputs = set(g.inputs())
+    outputs = set(g.outputs())
+
+    verts_row: Dict[FloatInt, List['VT']] = {}
+    for v in g.vertices():
+        verts_row.setdefault(rows[v], []).append(v)
+
+    frontier = 2 * len(inputs)        # accumulator seeded with one id2 per input
+    peak = frontier
+    log_flops = float("-inf")         # log2(0)
+
+    for r in sorted(verts_row):
+        for v in sorted(verts_row[r]):
+            if types[v] == VertexType.DUMMY:
+                continue
+            if v in inputs:
+                continue
+            incident = list(g.incident_edges(v))
+            non_self = [e for e in incident if g.edge_s(e) != g.edge_t(e)]
+            m = len(non_self)
+            s = len(incident) - m                          # self-loop edges
+            vt_arity = 0 if v in outputs else m + 2 * s     # dense vertex tensor (id2 for outputs)
+            if v in outputs:
+                m += 1                                      # output pads one external leg
+            c = 0
+            for e in non_self:
+                a, b = g.edge_st(e)
+                n = b if a == v else a
+                if rows[n] < r or (rows[n] == r and n < v):
+                    c += 1
+            log_flops = np.logaddexp2(log_flops, frontier + m - c)
+            frontier = frontier + m - 2 * c
+            peak = max(peak, frontier, vt_arity)            # accumulator AND vertex tensor
+
+    return peak, float(log_flops)
+
+def _default_max_memory() -> int:
+    """Byte budget for ``strategy='auto'`` when ``max_memory`` is not given:
+    ``pyzx.settings.tensor_auto_memory_fraction`` of available RAM (via the optional
+    :mod:`psutil` dependency), or ``pyzx.settings.tensor_auto_max_memory_fallback`` bytes
+    when psutil is not installed."""
+    try:
+        import psutil  # type: ignore[import-untyped]
+        return int(psutil.virtual_memory().available * settings.tensor_auto_memory_fraction)
+    except ImportError:
+        return settings.tensor_auto_max_memory_fallback
+
+def _tensorfy_auto(g: 'BaseGraph[VT,ET]',
+                   preserve_scalar: bool = True,
+                   max_memory: Optional[int] = None,
+                   verbose: bool = False) -> NDArray[np.complex128]:
+    """Choose a backend for ``g`` by predicted peak memory and run it (see :func:`tensorfy`
+    with ``strategy='auto'``). The whole decision is in one currency -- peak memory in bytes --
+    with no fitted speed constants. ``max_memory=None`` uses :func:`_default_max_memory`."""
+    from .simplify import full_reduce
+    from .rank_width import (greedy_b2t_decomposition, greedy_linear_order,
+                             linear_decomposition, rank_score_flops, rw_peak_exact,
+                             tensorfy_rw)
+
+    budget = _default_max_memory() if max_memory is None else max_memory
+
+    def fits(peak: int) -> bool:
+        return 16 * 2 ** peak <= budget
+
+    # Tier 1 -- capability gate. No backend handles symbolic phases; only naive handles
+    # H_BOX/W/Z_BOX, so a diagram containing them is forced to naive (still memory-guarded).
+    phases = g.phases()
+    types = g.types()
+    blocked = False
+    for v in g.vertices():
+        if isinstance(phases[v], Poly):
+            raise ValueError(f"Can't convert diagram with parameters to tensor: {phases[v]}")
+        if types[v] in _RW_BLOCKERS:
+            blocked = True
+    if blocked:
+        peak, _ = naive_cost_estimate(g)
+        if not fits(peak):
+            raise MemoryError(f"diagram needs ~16*2^{peak} bytes; H_BOX/W/Z_BOX force the "
+                              f"naive backend (rank-width cannot handle them)")
+        if verbose:
+            print(f"auto: rw-blocked vertex type present -> naive (peak={peak})")
+        return tensorfy_naive(g, preserve_scalar=preserve_scalar)
+
+    # Tier 2 -- exact frontier estimate on the raw graph.
+    peak_raw, flops_raw = naive_cost_estimate(g)
+    if fits(peak_raw) and flops_raw <= _FAST_ENOUGH:
+        if verbose:
+            print(f"auto: raw-naive fits & cheap (peak={peak_raw}, flops={flops_raw:.1f}) -> naive")
+        return tensorfy_naive(g, preserve_scalar=preserve_scalar)
+
+    # Raw-naive is big or slow: does full_reduce give a cheaper naive? full_reduce crushes
+    # tangled/closed diagrams but makes circuits worse, so estimate both and pick the lighter.
+    g_red = g.copy()
+    full_reduce(g_red)
+    peak_red, _ = naive_cost_estimate(g_red)
+
+    naive_opts = [(peak_raw, g), (peak_red, g_red)]
+    feasible = [(p, gg) for (p, gg) in naive_opts if fits(p)]
+    if feasible:
+        p, gg = min(feasible, key=lambda o: o[0])
+        if verbose:
+            print(f"auto: naive on {'reduced' if gg is g_red else 'raw'} (peak={p}) -> naive")
+        return tensorfy_naive(gg, preserve_scalar=preserve_scalar)
+
+    # Neither naive variant fits -> rank-width (guarded; rw can OOM too). Build both heuristic
+    # decompositions, take each one's exact peak, and choose budget-aware -- rw-auto's flops
+    # choice is sometimes the memory-heavier decomposition.
+    decomps = [greedy_b2t_decomposition(g_red),
+               linear_decomposition(greedy_linear_order(g_red))]
+    cands = [(rw_peak_exact(d, g_red), rank_score_flops(d, g_red), d) for d in decomps]
+    fitting = [c for c in cands if fits(c[0])]
+    rw_peak, _, rw_decomp = (min(fitting, key=lambda c: c[1]) if fitting    # fits -> fastest plan
+                             else min(cands, key=lambda c: c[0]))           # none fit -> lightest
+
+    options = [(peak_raw, 'naive', g), (peak_red, 'naive', g_red), (rw_peak, 'rw', g_red)]
+    peak_min, backend, graph_min = min(options, key=lambda o: o[0])   # ties -> naive (list order)
+    if fits(peak_min):
+        if verbose:
+            print(f"auto: both naive over budget; lightest = {backend} (peak={peak_min}) -> {backend}")
+        if backend == 'rw':
+            return tensorfy_rw(g_red, decomp=rw_decomp, skip_reduce=True,
+                               preserve_scalar=preserve_scalar, verbose=verbose)
+        return tensorfy_naive(graph_min, preserve_scalar=preserve_scalar)
+    raise MemoryError(f"diagram needs ~16*2^{peak_min} bytes in the lightest backend "
+                      f"(naive raw 2^{peak_raw} / reduced 2^{peak_red} / rw 2^{rw_peak}); "
+                      f"raise max_memory or simplify the diagram first")
 
 def tensor_to_matrix(t: np.ndarray, inputs: int, outputs: int) -> np.ndarray:
     """Takes a tensor generated by ``tensorfy`` and turns it into a matrix.

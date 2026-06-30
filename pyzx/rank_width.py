@@ -169,6 +169,48 @@ def rank_score_flops(decomp: Union[List, int, None],
     return log2(max(score, 1))
 
 
+def rw_peak_exact(decomp: Union[List, int, None],
+                  g: BaseGraph,
+                  calc_rs: bool = True) -> int:
+    """
+    Exact log2 of the largest array ``tensorfy_rw`` allocates for this decomposition,
+    computed from the decomposition alone (no tensors built); the memory is
+    ``16 * 2**rw_peak_exact`` bytes. Mirrors :func:`conv`'s branch dispatch: each internal node
+    materialises a transient whose size is set by which of ``(r_u, r_v, r_w)`` is largest, plus
+    its own result ``Psi_u`` of size ``2**(b_u + r_u)`` (``b_u`` = boundary leaves in the subtree).
+
+    Args:
+        decomp: rank-decomposition
+        g: ZX diagram
+        calc_rs: whether calculating cut-ranks is necessary
+
+    Returns:
+        log2(peak number of entries)
+    """
+
+    def iterate(data) -> Tuple[int, int, int]:
+        if data is None:
+            return 0, 0, 0
+        if isinstance(data[0], int):                       # leaf: boundary (2,2) or Z (1,2)
+            b = 1 if g.type(data[0]) == VertexType.BOUNDARY else 0
+            r = data[1].rank()
+            return b, r, b + r
+        b_v, r_v, peak_v = iterate(data[0][0])
+        b_w, r_w, peak_w = iterate(data[0][1])
+        r_u = data[1].rank()
+        b_u = b_v + b_w
+        r_max = max(r_u, r_v, r_w)
+        if r_u == r_max:                                   # conv_vw (np.kron transient)
+            transient = b_u + r_v + r_w
+        elif r_v == r_max:                                 # conv_uv, swapped
+            transient = b_v + r_w + r_u
+        else:                                              # conv_uv
+            transient = b_w + r_v + r_u
+        return b_u, r_u, max(peak_v, peak_w, transient, b_u + r_u)
+
+    return iterate(calc_ranks(decomp, g) if calc_rs else decomp)[2]
+
+
 def greedy_linear_order(g: BaseGraph) -> List[int]:
     """
     Linear rank-decomposition obtained by greedily taking the next vertex.
@@ -567,7 +609,9 @@ def tensorfy_rw_subtree(g: BaseGraph,
 def tensorfy_rw(g: BaseGraph,
                 strategy: str = 'rw-auto',
                 preserve_scalar: bool = True,
-                verbose: bool = False) -> NDArray[np.complex128]:
+                verbose: bool = False,
+                skip_reduce: bool = False,
+                decomp: Union[List, int, None] = None) -> NDArray[np.complex128]:
     """
     Evaluate the tensor diagram corresponding to g using the rank-width method.
 
@@ -576,13 +620,20 @@ def tensorfy_rw(g: BaseGraph,
         strategy: rank-decomposition strategy
         preserve_scalar: whether to account for the diagram scalar
         verbose: print additional info
+        skip_reduce: if True, assume ``g`` is already ``full_reduce``d and use it directly
+            (no copy, no reduce). Lets a caller that already reduced the graph avoid repeating it.
+        decomp: a precomputed rank-decomposition of ``g``; if given, ``generate_decomposition``
+            is skipped. Must be consistent with the graph actually used, so pass it together
+            with ``skip_reduce=True`` and an already-reduced ``g``.
 
     Returns:
         Numpy tensor having (num_outputs + num_inputs) dimensions (output dimensions first)
     """
-    g = g.copy()
-    full_reduce(g)
-    decomp = generate_decomposition(g, strategy=strategy, verbose=verbose)
+    if not skip_reduce:
+        g = g.copy()
+        full_reduce(g)
+    if decomp is None:
+        decomp = generate_decomposition(g, strategy=strategy, verbose=verbose)
     if decomp is None:
         return np.array(g.scalar.to_number() ** preserve_scalar)
     result, _, _, boundary = tensorfy_rw_subtree(g, decomp, verbose=verbose)

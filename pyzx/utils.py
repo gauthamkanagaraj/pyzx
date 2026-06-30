@@ -240,6 +240,11 @@ class Settings(object): # namespace class
     # Maximum denominator when converting floats to fractions (e.g., for phase values).
     # Higher values preserve more precision but may produce larger fractions.
     float_to_fraction_max_denominator: int = 2**20
+    # Default memory budget for `tensorfy(strategy='auto')` when `max_memory` is not given:
+    # `tensor_auto_memory_fraction` of detected available RAM (via the optional `psutil`
+    # dependency), or `tensor_auto_max_memory_fallback` bytes when psutil is not installed.
+    tensor_auto_memory_fraction: float = 0.25
+    tensor_auto_max_memory_fallback: int = 4 * 2**30  # 4 GiB
     # When True, reject float phases at `set_phase`/`add_to_phase` rather than
     # silently rounding them to a nearby fraction. Set to False to opt in to
     # automatic conversion using `float_to_fraction_max_denominator`.

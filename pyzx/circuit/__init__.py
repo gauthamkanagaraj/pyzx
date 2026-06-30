@@ -320,13 +320,15 @@ class Circuit(object):
             elide_initial_resets=elide_initial_resets,
         )
 
-    def to_tensor(self, preserve_scalar:bool=True, strategy:str='naive') -> np.ndarray:
+    def to_tensor(self, preserve_scalar:bool=True, strategy:str='naive',
+                  max_memory: Optional[int]=None) -> np.ndarray:
         """Returns a numpy tensor describing the circuit."""
-        return self.to_graph().to_tensor(preserve_scalar, strategy)
+        return self.to_graph().to_tensor(preserve_scalar, strategy, max_memory)
 
-    def to_matrix(self, preserve_scalar=True, strategy:str='naive') -> np.ndarray:
+    def to_matrix(self, preserve_scalar=True, strategy:str='naive',
+                  max_memory: Optional[int]=None) -> np.ndarray:
         """Returns a numpy matrix describing the circuit."""
-        return self.to_graph().to_matrix(preserve_scalar, strategy)
+        return self.to_graph().to_matrix(preserve_scalar, strategy, max_memory)
 
     def to_emoji(self) -> str:
         """Converts circuit into a representation that can be copy-pasted

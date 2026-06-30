@@ -11,6 +11,7 @@ Hence, occasionally changes will be backwards incompatible (although they will a
 ### Added
 - Added the "magic cat" decomposition strategy from https://arxiv.org/pdf/2202.09202 (which previously only existed in Quizx). (by @mjsutcliffe99).
 - `settings.strict_phase_types` (default `True`) rejects float phases at `set_phase`/`add_to_phase` rather than letting them flow into the graph and crash downstream rewrite rules. Set to `False` to opt in to automatic conversion to `Fraction` using `settings.float_to_fraction_max_denominator`, accepting the resulting precision loss. Fixes crash in `full_reduce` with non-Clifford spiders (by @dlyongemallo).
+- `tensorfy(g, strategy='auto')`: automatically selects a tensor-contraction backend by predicted peak memory. It estimates the naive backend's peak with an exact O(V+E) structural dry-run (on both the raw graph and its `full_reduce`d form) and runs naive on whichever is cheaper and fits the budget, falling back to the rank-width backend — itself guarded by an exact rank-width peak — only when neither naive variant does. Raises `MemoryError` reporting the predicted sizes when nothing fits. Adds a `max_memory` argument (default: `pyzx.settings.tensor_auto_memory_fraction` of available RAM via optional `psutil`, or `pyzx.settings.tensor_auto_max_memory_fallback` bytes when it is absent), threaded through `tensorfy`, `to_tensor`, and `to_matrix` (by @gauthamkanagaraj).
 
 ## [0.10.3] - 2026-06-01
 
